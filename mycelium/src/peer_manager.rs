@@ -1,4 +1,6 @@
-use crate::connection::Quic;
+#[cfg(feature = "private-network")]
+use crate::connection::tls::TlsStream;
+use crate::connection::{Quic, TcpStream};
 use crate::endpoint::{Endpoint, Protocol};
 use crate::metrics::Metrics;
 use crate::peer::{Peer, PeerRef};
@@ -9,7 +11,7 @@ use futures::{FutureExt, StreamExt};
 #[cfg(feature = "private-network")]
 use openssl::ssl::{Ssl, SslAcceptor, SslConnector, SslMethod};
 use quinn::crypto::rustls::QuicClientConfig;
-use quinn::{MtuDiscoveryConfig, ServerConfig, TransportConfig};
+use quinn::{congestion, MtuDiscoveryConfig, ServerConfig, TransportConfig};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -24,7 +26,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{collections::hash_map::Entry, future::IntoFuture};
-use tokio::net::TcpStream;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::task::AbortHandle;
 use tokio::time::{Instant, MissedTickBehavior};
@@ -496,7 +497,7 @@ where
             None
         };
 
-        match TcpStream::connect(endpoint.address())
+        match tokio::net::TcpStream::connect(endpoint.address())
             .map(|result| result.and_then(|socket| set_fw_mark(socket, self.firewall_mark)))
             .await
         {
@@ -545,35 +546,57 @@ where
                         }
                         debug!("Completed TLS handshake");
 
+                        let tls_stream = match TlsStream::new(ssl_stream, ct.rx_bytes, ct.tx_bytes)
+                        {
+                            Ok(tls_stream) => tls_stream,
+                            Err(err) => {
+                                error!(%err, "Failed to create wrapped Tls stream");
+                                return (endpoint, None);
+                            }
+                        };
+
                         Peer::new(
                             router_data_tx,
                             router_control_tx,
-                            ssl_stream,
+                            tls_stream,
                             dead_peer_sink,
-                            ct.tx_bytes,
-                            ct.rx_bytes,
                         )
                     } else {
+                        let peer_stream =
+                            match TcpStream::new(peer_stream, ct.rx_bytes, ct.tx_bytes) {
+                                Ok(ps) => ps,
+                                Err(err) => {
+                                    error!(%err, "Failed to create wrapped tcp stream");
+                                    return (endpoint, None);
+                                }
+                            };
+
                         Peer::new(
                             router_data_tx,
                             router_control_tx,
                             peer_stream,
                             dead_peer_sink,
-                            ct.tx_bytes,
-                            ct.rx_bytes,
                         )
                     }
                 };
 
                 #[cfg(not(feature = "private-network"))]
-                let res = Peer::new(
-                    router_data_tx,
-                    router_control_tx,
-                    peer_stream,
-                    dead_peer_sink,
-                    ct.tx_bytes,
-                    ct.rx_bytes,
-                );
+                let res = {
+                    let peer_stream = match TcpStream::new(peer_stream, ct.rx_bytes, ct.tx_bytes) {
+                        Ok(ps) => ps,
+                        Err(err) => {
+                            error!(%err, "Failed to create wrapped tcp stream");
+                            return (endpoint, None);
+                        }
+                    };
+
+                    Peer::new(
+                        router_data_tx,
+                        router_control_tx,
+                        peer_stream,
+                        dead_peer_sink,
+                    )
+                };
 
                 match res {
                     Ok(new_peer) => {
@@ -630,29 +653,23 @@ where
         transport_config.mtu_discovery_config(Some(MtuDiscoveryConfig::default()));
         transport_config.keep_alive_interval(Some(Duration::from_secs(20)));
         // we don't use datagrams.
-        transport_config.datagram_receive_buffer_size(None);
-        transport_config.datagram_send_buffer_size(0);
+        transport_config.datagram_receive_buffer_size(Some(16 << 20));
+        transport_config.datagram_send_buffer_size(16 << 20);
+        transport_config.initial_mtu(1500);
         config.transport_config(Arc::new(transport_config));
 
         match quic_socket.connect_with(config, endpoint.address(), "dummy.mycelium") {
             Ok(connecting) => match connecting.await {
                 Ok(con) => match con.open_bi().await {
                     Ok((tx, rx)) => {
-                        let q_con = Quic::new(tx, rx, endpoint.address());
+                        let q_con = Quic::new(tx, rx, con, ct.tx_bytes, ct.rx_bytes);
                         let res = {
                             let router = self.router.lock().unwrap();
                             let router_data_tx = router.router_data_tx();
                             let router_control_tx = router.router_control_tx();
                             let dead_peer_sink = router.dead_peer_sink().clone();
 
-                            Peer::new(
-                                router_data_tx,
-                                router_control_tx,
-                                q_con,
-                                dead_peer_sink,
-                                ct.tx_bytes,
-                                ct.rx_bytes,
-                            )
+                            Peer::new(router_data_tx, router_control_tx, q_con, dead_peer_sink)
                         };
                         match res {
                             Ok(new_peer) => {
@@ -760,42 +777,71 @@ where
                             }
                             debug!(%remote, "Accepted TLS handshake");
 
+                            let tls_stream = match TlsStream::new(
+                                ssl_stream,
+                                rx_bytes.clone(),
+                                tx_bytes.clone(),
+                            ) {
+                                Ok(tls_stream) => tls_stream,
+                                Err(err) => {
+                                    error!(%err, "Failed to create wrapped Tls stream");
+                                    continue;
+                                }
+                            };
+
                             Peer::new(
                                 router_data_tx.clone(),
                                 router_control_tx.clone(),
-                                ssl_stream,
+                                tls_stream,
                                 dead_peer_sink.clone(),
-                                tx_bytes.clone(),
-                                rx_bytes.clone(),
                             )
                         } else {
+                            let new_stream =
+                                match TcpStream::new(stream, rx_bytes.clone(), tx_bytes.clone()) {
+                                    Ok(ns) => ns,
+                                    Err(err) => {
+                                        error!(%err, "Failed to create wrapped tcp stream");
+                                        continue;
+                                    }
+                                };
+
                             Peer::new(
                                 router_data_tx.clone(),
                                 router_control_tx.clone(),
-                                stream,
+                                new_stream,
                                 dead_peer_sink.clone(),
-                                tx_bytes.clone(),
-                                rx_bytes.clone(),
                             )
                         };
 
                         #[cfg(not(feature = "private-network"))]
-                        let new_peer = Peer::new(
-                            router_data_tx.clone(),
-                            router_control_tx.clone(),
-                            stream,
-                            dead_peer_sink.clone(),
-                            tx_bytes.clone(),
-                            rx_bytes.clone(),
-                        );
+                        let new_peer = {
+                            let new_stream =
+                                match TcpStream::new(stream, rx_bytes.clone(), tx_bytes.clone()) {
+                                    Ok(ns) => ns,
+                                    Err(err) => {
+                                        error!(%err, "Failed to create wrapped tcp stream");
+                                        continue;
+                                    }
+                                };
 
-                        let new_peer = match new_peer {
-                            Ok(peer) => peer,
-                            Err(e) => {
-                                error!(err=%e, "Failed to spawn peer");
-                                continue;
+                            Peer::new(
+                                router_data_tx.clone(),
+                                router_control_tx.clone(),
+                                new_stream,
+                                dead_peer_sink.clone(),
+                            )
+                        };
+
+                        let new_peer = {
+                            match new_peer {
+                                Ok(peer) => peer,
+                                Err(e) => {
+                                    error!(err=%e, "Failed to spawn peer");
+                                    continue;
+                                }
                             }
                         };
+
                         info!("Accepted new inbound peer");
                         self.add_peer(
                             Endpoint::new(
@@ -863,24 +909,25 @@ where
                                 return;
                             }
                         };
+                        let remote_address = con.remote_address();
+
+
+                        let tx_bytes = Arc::new(AtomicU64::new(0));
+                        let rx_bytes = Arc::new(AtomicU64::new(0));
 
                         let quic_peer = match con.accept_bi().await {
-                            Ok((tx, rx)) => Quic::new(tx, rx, con.remote_address()),
+                            Ok((tx, rx)) => Quic::new(tx, rx, con, rx_bytes.clone(), tx_bytes.clone()),
                             Err(e) => {
                                 debug!(err=%e, "Failed to accept bidirectional quic stream");
                                 return;
                             }
                         };
 
-                        let tx_bytes = Arc::new(AtomicU64::new(0));
-                        let rx_bytes = Arc::new(AtomicU64::new(0));
                         let new_peer = match Peer::new(
                             router_data_tx.clone(),
                             router_control_tx.clone(),
                             quic_peer,
                             dead_peer_sink.clone(),
-                            tx_bytes.clone(),
-                            rx_bytes.clone(),
                         ) {
                             Ok(peer) => peer,
                             Err(e) => {
@@ -888,9 +935,9 @@ where
                                 return;
                             }
                         };
-                        info!(remote=%con.remote_address(), "Accepted new inbound quic peer");
+                        info!(remote=%remote_address, "Accepted new inbound quic peer");
                         self.add_peer(
-                            Endpoint::new(Protocol::Quic, con.remote_address()),
+                            Endpoint::new(Protocol::Quic, remote_address),
                             PeerType::Inbound,
                             ConnectionTraffic { tx_bytes, rx_bytes },
                             Some(new_peer),
@@ -1206,16 +1253,21 @@ fn make_quic_endpoint(
     transport_config.max_idle_timeout(Some(Duration::from_secs(60).try_into()?));
     transport_config.mtu_discovery_config(Some(MtuDiscoveryConfig::default()));
     transport_config.keep_alive_interval(Some(Duration::from_secs(20)));
-    // we don't use datagrams.
-    transport_config.datagram_receive_buffer_size(None);
-    transport_config.datagram_send_buffer_size(0);
-    // TODO: further tweak this.
+    transport_config.datagram_receive_buffer_size(Some(16 << 20));
+    transport_config.datagram_send_buffer_size(16 << 20);
+    transport_config.initial_mtu(1500);
+    transport_config.enable_segmentation_offload(true);
+    transport_config.send_window((8 * (10u32 << 20)).into());
+    transport_config.stream_receive_window((10u32 << 20).into());
+    let mut congestion_controller = congestion::CubicConfig::default();
+    congestion_controller.initial_window(1 << 22); // 4MiB
+                                                   // TODO: further tweak this.
 
     let socket = std::net::UdpSocket::bind(("::", quic_listen_port))
         .and_then(|socket| set_fw_mark(socket, firewall_mark))?;
     debug!("Bound UDP socket for Quic");
 
-    //TODO tweak or confirm
+    // TODO: tweak or confirm
     let endpoint = quinn::Endpoint::new(
         quinn::EndpointConfig::default(),
         Some(server_config),

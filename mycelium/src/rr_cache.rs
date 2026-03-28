@@ -27,6 +27,9 @@ pub struct RouteRequestCache {
     /// to.
     cache: Arc<DashMap<Subnet, RouteRequestInfo, ahash::RandomState>>,
 
+    /// The duration before an entry is considered expired.
+    expiration: Duration,
+
     _cleanup_task: Arc<AbortHandle>,
 }
 
@@ -57,12 +60,13 @@ impl RouteRequestCache {
                         trace!("Cleaning route request cache");
 
                         cache.retain(|subnet, info: &mut RouteRequestInfo| {
-                            if info.sent.elapsed() < expiration {
-                                false
-                            } else {
+                            let elapsed = info.sent.elapsed() >= expiration;
+
+                            if elapsed {
                                 trace!(%subnet, "Removing exired route request from cache");
-                                true
                             }
+
+                            !elapsed
                         });
                     }
                 }
@@ -73,6 +77,7 @@ impl RouteRequestCache {
 
         Self {
             cache,
+            expiration,
             _cleanup_task,
         }
     }
@@ -95,9 +100,12 @@ impl RouteRequestCache {
     }
 
     /// Get cached info about a route request for a subnet, if it exists.
+    ///
+    /// If an entry exists, but is otherwise expired, [`None`] is returned.
     pub fn info(&self, subnet: Subnet) -> Option<(u8, Vec<Peer>)> {
         self.cache
             .get(&subnet)
+            .filter(|rri| rri.sent.elapsed() <= self.expiration)
             .map(|rri| (rri.generation, rri.receivers.clone()))
     }
 }

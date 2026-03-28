@@ -64,7 +64,6 @@ impl Http {
             .route("/admin/routes/selected", get(get_selected_routes))
             .route("/admin/routes/fallback", get(get_fallback_routes))
             .route("/admin/routes/queried", get(get_queried_routes))
-            .route("/admin/routes/no_route", get(get_no_route_entries))
             .route(
                 "/admin/proxy",
                 get(list_proxies)
@@ -72,6 +71,7 @@ impl Http {
                     .delete(disconnect_proxy),
             )
             .route("/admin/proxy/probe", get(start_probe).delete(stop_probe))
+            .route("/admin/stats/packets", get(get_packet_statistics))
             .route("/pubkey/{ip}", get(get_pubk_from_ip))
             .with_state(server_state.clone());
         let app = Router::new().nest("/api/v1", admin_routes);
@@ -283,40 +283,56 @@ where
     Json(queries)
 }
 
-/// Info about a subnet with no route. This uses base types only to avoid having to introduce too
-/// many Serialize bounds in the core types.
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, PartialOrd, Eq, Ord)]
+/// Statistics for packets routed for a single IP address.
+#[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
-pub struct NoRouteSubnet {
-    /// We convert the [`subnet`](Subnet) to a string to avoid introducing a bound on the actual
-    /// type.
-    pub subnet: String,
-    /// The amount of time left before the query expires.
-    pub expiration: String,
+pub struct PacketStatEntry {
+    /// IP address.
+    pub ip: String,
+    /// Number of packets routed.
+    pub packet_count: u64,
+    /// Total bytes routed.
+    pub byte_count: u64,
 }
 
-async fn get_no_route_entries<M>(State(state): State<ServerState<M>>) -> Json<Vec<NoRouteSubnet>>
+/// Packet statistics grouped by source and destination.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct PacketStatistics {
+    /// Statistics per source IP.
+    pub by_source: Vec<PacketStatEntry>,
+    /// Statistics per destination IP.
+    pub by_destination: Vec<PacketStatEntry>,
+}
+
+/// Get packet statistics grouped by source and destination IP.
+async fn get_packet_statistics<M>(State(state): State<ServerState<M>>) -> Json<PacketStatistics>
 where
     M: Metrics + Clone + Send + Sync + 'static,
 {
-    debug!("Loading no-route subnets");
-    let queries = state
-        .node
-        .lock()
-        .await
-        .no_route_entries()
-        .into_iter()
-        .map(|nrs| NoRouteSubnet {
-            subnet: nrs.subnet().to_string(),
-            expiration: nrs
-                .entry_expires()
-                .duration_since(Instant::now())
-                .as_secs()
-                .to_string(),
-        })
-        .collect();
+    debug!("Loading packet statistics");
+    let stats = state.node.lock().await.packet_statistics();
 
-    Json(queries)
+    Json(PacketStatistics {
+        by_source: stats
+            .by_source
+            .into_iter()
+            .map(|ps| PacketStatEntry {
+                ip: ps.ip.to_string(),
+                packet_count: ps.packet_count,
+                byte_count: ps.byte_count,
+            })
+            .collect(),
+        by_destination: stats
+            .by_destination
+            .into_iter()
+            .map(|ps| PacketStatEntry {
+                ip: ps.ip.to_string(),
+                packet_count: ps.packet_count,
+                byte_count: ps.byte_count,
+            })
+            .collect(),
+    })
 }
 
 async fn list_proxies<M>(State(state): State<ServerState<M>>) -> Json<Vec<Ipv6Addr>>

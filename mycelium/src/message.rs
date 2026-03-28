@@ -20,13 +20,13 @@ use std::{
 };
 
 use futures::{Stream, StreamExt};
-use rand::Fill;
+use rand::RngExt;
 use serde::{de::Visitor, Deserialize, Deserializer, Serialize};
 #[cfg(target_family = "unix")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(target_family = "unix")]
 use tokio::net::UnixStream;
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify};
 use topic::MessageAction;
 use tracing::{debug, error, trace, warn};
 
@@ -116,6 +116,8 @@ pub struct MessageStack<M> {
     reply_subscribers: Arc<Mutex<HashMap<MessageId, watch::Sender<Option<ReceivedMessage>>>>>,
     /// Topic-specific configuration
     topic_config: Arc<RwLock<TopicConfig>>,
+    /// Notification for the outbox retransmission loops to wake up immediately (e.g. on ACK).
+    outbox_notify: Arc<Notify>,
 }
 
 struct MessageOutbox {
@@ -261,6 +263,7 @@ where
             subscriber,
             reply_subscribers: Arc::new(Mutex::new(HashMap::new())),
             topic_config: Arc::new(RwLock::new(topic_config.unwrap_or_default())),
+            outbox_notify: Arc::new(Notify::new()),
         };
 
         tokio::task::spawn(
@@ -342,6 +345,8 @@ where
                     })
                 }
                 message.chunks = chunks;
+                // Wake retransmission loop to start sending chunks immediately.
+                self.outbox_notify.notify_waiters();
             }
         } else if flags.chunk() {
             // ACK for a chunk, mark chunk as received so it is not retried again.
@@ -354,7 +359,7 @@ where
                 let mc = MessageChunk::new(mp);
                 // Sanity checks. This is just to protect ourselves, if the other party is
                 // malicious it can return any data it wants here.
-                if mc.chunk_idx() > message.chunks.len() as u64 {
+                if mc.chunk_idx() >= message.chunks.len() as u64 {
                     debug!("Dropping CHUNK ACK for message because ACK'ed chunk is out of bounds");
                     return;
                 }
@@ -364,6 +369,8 @@ where
 
                 message.chunks[mc.chunk_idx() as usize].chunk_transmit_state =
                     ChunkTransmitState::Acked;
+                // Wake retransmission loop to send next chunk immediately.
+                self.outbox_notify.notify_waiters();
             }
         } else if flags.done() {
             // ACK for full message.
@@ -588,6 +595,10 @@ where
                         // Clone the message for use in the async task
                         let message_clone = message.clone();
                         let message_stack = self.clone();
+
+                        // Remove from pending before dropping the lock, so a duplicate DONE
+                        // arriving while the async task runs won't process the message again.
+                        inbox.pending_msges.remove(&message_id);
 
                         // Drop the inbox lock before spawning the task to avoid deadlocks
                         std::mem::drop(inbox);
@@ -1020,6 +1031,7 @@ where
 
         // Clone message stack so it can be injected in the task.
         let message_stack = self.clone();
+        let outbox_notify = self.outbox_notify.clone();
         tokio::task::spawn(async move {
             let mut deadline = tokio::time::interval(MESSAGE_SEND_WINDOW);
             let mut interval = tokio::time::interval(RETRANSMISSION_DELAY);
@@ -1032,10 +1044,22 @@ where
             let mut aborted = false;
 
             loop {
-                tokio::select! {
-                    _ = interval.tick() => {
+                // Wait for either a periodic tick, an ACK notification, or the deadline.
+                // Both the tick and notify branches perform the same send logic below.
+                enum WakeReason {
+                    Send,
+                    Deadline,
+                }
+                let reason = tokio::select! {
+                    _ = interval.tick() => WakeReason::Send,
+                    _ = outbox_notify.notified() => WakeReason::Send,
+                    _ = deadline.tick() => WakeReason::Deadline,
+                };
+
+                match reason {
+                    WakeReason::Send => {
                         if aborted {
-                            continue
+                            continue;
                         }
                         if let Some(msg) = message_stack.outbox.lock().unwrap().msges.get_mut(&id) {
                             match msg.state {
@@ -1062,31 +1086,39 @@ where
                                                     mi.into_inner().into_inner(),
                                                 );
                                         }
-                                        _ => debug!("Can only send messages between two IPv6 addresses"),
+                                        _ => debug!(
+                                            "Can only send messages between two IPv6 addresses"
+                                        ),
                                     }
                                 }
                                 TransmissionState::InProgress => {
                                     // Send chunks which haven't been sent yet.
                                     let mut all_acked = true;
                                     for chunk in msg.chunks.iter_mut() {
-                                        if !matches!(chunk.chunk_transmit_state, ChunkTransmitState::Acked)
-                                        {
+                                        if !matches!(
+                                            chunk.chunk_transmit_state,
+                                            ChunkTransmitState::Acked
+                                        ) {
                                             all_acked = false;
                                         }
                                         match chunk.chunk_transmit_state {
                                             ChunkTransmitState::Started => {
                                                 // Generate and send chunk, move chunk to state sent
-                                                let mut mp = MessagePacket::new(PacketBuffer::new());
+                                                let mut mp =
+                                                    MessagePacket::new(PacketBuffer::new());
                                                 mp.header_mut().set_message_id(id);
 
                                                 let mut mc = MessageChunk::new(mp);
                                                 mc.set_chunk_idx(chunk.chunk_idx as u64);
                                                 mc.set_chunk_offset(chunk.chunk_offset as u64);
-                                                if let Err(e) = mc.set_chunk_data(
+                                                if let Err(err) = mc.set_chunk_data(
                                                     &msg.msg.data[chunk.chunk_offset
                                                         ..chunk.chunk_offset + chunk.chunk_size],
                                                 ) {
-                                                    error!("Failed to generate and send chunk: {e}");
+                                                    error!(
+                                                        %err,
+                                                        "Failed to generate and send chunk"
+                                                    );
                                                 };
 
                                                 match (msg.msg.src, msg.msg.dst) {
@@ -1109,9 +1141,10 @@ where
                                                     ChunkTransmitState::Sent(time::Instant::now());
                                             }
                                             ChunkTransmitState::Sent(t) => {
-                                                if t.elapsed().as_secs() >= 1 {
+                                                if t.elapsed() >= RETRANSMISSION_DELAY {
                                                     // retransmit
-                                                    let mut mp = MessagePacket::new(PacketBuffer::new());
+                                                    let mut mp =
+                                                        MessagePacket::new(PacketBuffer::new());
                                                     mp.header_mut().set_message_id(id);
 
                                                     let mut mc = MessageChunk::new(mp);
@@ -1119,7 +1152,8 @@ where
                                                     mc.set_chunk_offset(chunk.chunk_offset as u64);
                                                     if let Err(e) = mc.set_chunk_data(
                                                         &msg.msg.data[chunk.chunk_offset
-                                                            ..chunk.chunk_offset + chunk.chunk_size],
+                                                            ..chunk.chunk_offset
+                                                                + chunk.chunk_size],
                                                     ) {
                                                         error!("Failed to generate and send chunk: {e}");
                                                     };
@@ -1141,7 +1175,9 @@ where
                                                     ),
                                                     }
                                                     chunk.chunk_transmit_state =
-                                                        ChunkTransmitState::Sent(time::Instant::now());
+                                                        ChunkTransmitState::Sent(
+                                                            time::Instant::now(),
+                                                        );
                                                 }
                                             }
                                             ChunkTransmitState::Acked => {
@@ -1191,15 +1227,20 @@ where
                             // If the message is gone, just exit
                             return;
                         }
-                    },
-                    _ = deadline.tick() => {
+                    }
+                    WakeReason::Deadline => {
                         // The first time we get a tick to abort, abort the message if it is not
                         // received yet.
                         // The second time, clean up the storage.
                         if !aborted {
                             aborted = true;
-                            if let Some(msg) = message_stack.outbox.lock().unwrap().msges.get_mut(&id) {
-                                if matches!(msg.state, TransmissionState::Init | TransmissionState::InProgress) {
+                            if let Some(msg) =
+                                message_stack.outbox.lock().unwrap().msges.get_mut(&id)
+                            {
+                                if matches!(
+                                    msg.state,
+                                    TransmissionState::Init | TransmissionState::InProgress
+                                ) {
                                     msg.state = TransmissionState::Aborted;
 
                                     // Inform receiver of message abortion.
@@ -1207,31 +1248,28 @@ where
                                     mp.header_mut().set_message_id(id);
                                     mp.header_mut().flags_mut().set_aborted();
 
-
                                     match (msg.msg.src, msg.msg.dst) {
                                         (IpAddr::V6(src), IpAddr::V6(dst)) => {
                                             message_stack
                                                 .data_plane
                                                 .lock()
                                                 .unwrap()
-                                                .inject_message_packet(
-                                                    src,
-                                                    dst,
-                                                    mp.into_inner(),
-                                                );
+                                                .inject_message_packet(src, dst, mp.into_inner());
                                         }
                                         _ => {
-                                            debug!("Can only send messages between two IPv6 addresses")
+                                            debug!(
+                                                "Can only send messages between two IPv6 addresses"
+                                            )
                                         }
                                     };
                                 }
                             }
-                            continue
+                            continue;
                         }
 
                         // Second tick, clean up.
                         message_stack.outbox.lock().unwrap().msges.remove(&id);
-                        return
+                        return;
                     }
                 }
             }
@@ -1304,7 +1342,14 @@ where
                         .enumerate()
                         .find(|(_, v)| &v.topic == topic)
                     {
-                        return inbox.complete_msges.remove(idx).unwrap();
+                        let msg = if pop {
+                            inbox.complete_msges.remove(idx).unwrap()
+                        } else {
+                            inbox.complete_msges[idx].clone()
+                        };
+
+                        self.notify_read(&msg);
+                        return msg;
                     } else {
                         break 'check;
                     }
@@ -1359,6 +1404,7 @@ impl<M> Clone for MessageStack<M> {
             subscriber: self.subscriber.clone(),
             reply_subscribers: self.reply_subscribers.clone(),
             topic_config: self.topic_config.clone(),
+            outbox_notify: self.outbox_notify.clone(),
         }
     }
 }
@@ -1409,7 +1455,7 @@ impl MessageId {
     fn new() -> Self {
         let mut id = Self([0u8; 8]);
 
-        id.0.fill(&mut rand::rng());
+        rand::rng().fill(&mut id.0);
 
         id
     }

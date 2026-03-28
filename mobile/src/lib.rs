@@ -1,11 +1,13 @@
 use std::convert::TryFrom;
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 
 use tracing::{error, info};
 
 use metrics::Metrics;
 use mycelium::endpoint::Endpoint;
+use mycelium::peer_manager::PeerDiscoveryMode;
 use mycelium::{crypto, metrics, Config, Node};
 use once_cell::sync::Lazy;
 use tokio::sync::{mpsc, Mutex};
@@ -17,6 +19,13 @@ const CHANNEL_TIMEOUT: u64 = 2;
 /// Default Socks5 port.
 // TODO: Port should be included in mycelium response
 const DEFAULT_SOCKS_PORT: u16 = 1080;
+
+/// The default listening address for the HTTP API.
+const DEFAULT_HTTP_API_SERVER_ADDRESS: SocketAddr =
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8989);
+/// The default listening address for the JSON-RPC API.
+const DEFAULT_JSONRPC_API_SERVER_ADDRESS: SocketAddr =
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8990);
 
 #[cfg(target_os = "android")]
 fn setup_logging() {
@@ -78,7 +87,7 @@ static RESPONSE_CHANNEL: Lazy<ResponseChannelType> = Lazy::new(|| {
 
 #[tokio::main]
 #[allow(unused_variables)] // because tun_fd is only used in android and ios
-pub async fn start_mycelium(peers: Vec<String>, tun_fd: i32, priv_key: Vec<u8>, enable_dns: bool) {
+pub async fn start_mycelium(peers: Vec<String>, tun_fd: i32, priv_key: Vec<u8>, enable_dns: bool, enable_api_server: bool) {
     #[cfg(any(target_os = "android", target_os = "ios", target_os = "macos"))]
     setup_logging_once();
 
@@ -95,8 +104,9 @@ pub async fn start_mycelium(peers: Vec<String>, tun_fd: i32, priv_key: Vec<u8>, 
         peers: endpoints,
         no_tun: false,
         tcp_listen_port: DEFAULT_TCP_LISTEN_PORT,
-        quic_listen_port: None,
-        peer_discovery_port: None, // disable multicast discovery
+        quic_listen_port: Some(DEFAULT_QUIC_LISTEN_PORT),
+        peer_discovery_port: 9650,
+        peer_discovery_mode: PeerDiscoveryMode::Disabled, // disable multicast discovery
         #[cfg(any(
             target_os = "linux",
             all(target_os = "macos", not(feature = "mactunfd")),
@@ -117,15 +127,29 @@ pub async fn start_mycelium(peers: Vec<String>, tun_fd: i32, priv_key: Vec<u8>, 
         cdn_cache: None,
         enable_dns,
     };
-    let _node = match Node::new(config).await {
+    let node = match Node::new(config).await {
         Ok(node) => {
             info!("node successfully created");
-            node
+            Arc::new(Mutex::new(node))
         }
         Err(err) => {
             error!("failed to create mycelium node: {err}");
             return;
         }
+    };
+
+    // Only spawn API servers when enabled.
+    let (_http_api, _rpc_api) = if enable_api_server {
+        let http_api = mycelium_api::Http::spawn(node.clone(), DEFAULT_HTTP_API_SERVER_ADDRESS);
+        info!("HTTP API server started on {}", DEFAULT_HTTP_API_SERVER_ADDRESS);
+
+        let rpc_api = mycelium_api::rpc::JsonRpc::spawn(node.clone(), DEFAULT_JSONRPC_API_SERVER_ADDRESS).await;
+        info!("JSON-RPC API server started on {}", DEFAULT_JSONRPC_API_SERVER_ADDRESS);
+
+        (Some(http_api), Some(rpc_api))
+    } else {
+        info!("API servers disabled by configuration");
+        (None, None)
     };
 
     let mut rx = COMMAND_CHANNEL.1.lock().await;
@@ -144,7 +168,7 @@ pub async fn start_mycelium(peers: Vec<String>, tun_fd: i32, priv_key: Vec<u8>, 
                     }
                     CmdType::Status => {
                         let mut vec: Vec<String> = Vec::new();
-                        for info in _node.peer_info() {
+                        for info in node.lock().await.peer_info() {
                             // Create a JSON object with detailed peer statistics
                             let peer_json = serde_json::json!({
                                 "protocol": info.endpoint.proto().to_string(),
@@ -162,22 +186,22 @@ pub async fn start_mycelium(peers: Vec<String>, tun_fd: i32, priv_key: Vec<u8>, 
                     }
                     CmdType::ProxyProbeStart => {
                         info!("Received proxy probe start command");
-                        _node.start_proxy_scan();
+                        node.lock().await.start_proxy_scan();
                         send_response(vec![CHANNEL_MSG_OK.to_string()]).await;
                     },
                     CmdType::ProxyProbeStop => {
                         info!("Received proxy probe stop command");
-                        _node.stop_proxy_scan();
+                        node.lock().await.stop_proxy_scan();
                         send_response(vec![CHANNEL_MSG_OK.to_string()]).await;
                     },
                     CmdType::ProxyList => {
                         info!("Received proxy list command");
-                        let known_proxies = _node.known_proxies();
+                        let known_proxies = node.lock().await.known_proxies();
                         send_response(known_proxies.into_iter().map(|ip| SocketAddr::from((IpAddr::from(ip), DEFAULT_SOCKS_PORT)).to_string()).collect()).await;
                     },
                     CmdType::ProxyConnect(remote) => {
                         info!(?remote, "Received proxy connect command");
-                        let res = match _node.connect_proxy(remote).await {
+                        let res = match node.lock().await.connect_proxy(remote).await {
                             Ok(v) => v.to_string(),
                             Err(e) => e.to_string(),
                         };
@@ -185,7 +209,7 @@ pub async fn start_mycelium(peers: Vec<String>, tun_fd: i32, priv_key: Vec<u8>, 
                     },
                     CmdType::ProxyDisconnect => {
                         info!("Received proxy disconnect command");
-                        _node.disconnect_proxy();
+                        node.lock().await.disconnect_proxy();
                         send_response(vec![CHANNEL_MSG_OK.to_string()]).await;
                     },
 
@@ -397,6 +421,7 @@ impl Metrics for NoMetrics {}
 
 /// The default port on the underlay to listen on for incoming TCP connections.
 const DEFAULT_TCP_LISTEN_PORT: u16 = 9651;
+const DEFAULT_QUIC_LISTEN_PORT: u16 = 9651;
 
 fn convert_slice_to_array32(slice: &[u8]) -> Result<[u8; 32], std::array::TryFromSliceError> {
     <[u8; 32]>::try_from(slice)

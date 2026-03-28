@@ -23,7 +23,7 @@ use tokio::sync::Mutex;
 use tokio::time::Duration;
 use tracing::debug;
 
-use crate::{Info, Metric, NoRouteSubnet, QueriedSubnet, Route, ServerState};
+use crate::{Info, Metric, PacketStatEntry, PacketStatistics, QueriedSubnet, Route, ServerState};
 use mycelium::crypto::PublicKey;
 use mycelium::endpoint::Endpoint;
 use mycelium::metrics::Metrics;
@@ -61,9 +61,6 @@ pub trait MyceliumApi {
     #[method(name = "getQueriedSubnets")]
     async fn get_queried_subnets(&self) -> RpcResult<Vec<QueriedSubnet>>;
 
-    #[method(name = "getNoRouteEntries")]
-    async fn get_no_route_entries(&self) -> RpcResult<Vec<NoRouteSubnet>>;
-
     // Proxy methods
     #[method(name = "getProxies")]
     async fn get_proxies(&self) -> RpcResult<Vec<Ipv6Addr>>;
@@ -79,6 +76,10 @@ pub trait MyceliumApi {
 
     #[method(name = "stopProxyProbe")]
     async fn stop_proxy_probe(&self) -> RpcResult<bool>;
+
+    // Statistics methods
+    #[method(name = "getPacketStatistics")]
+    async fn get_packet_statistics(&self) -> RpcResult<PacketStatistics>;
 
     // OpenRPC discovery
     #[method(name = "rpc.discover")]
@@ -291,28 +292,6 @@ where
         Ok(queries)
     }
 
-    async fn get_no_route_entries(&self) -> RpcResult<Vec<NoRouteSubnet>> {
-        debug!("Loading no route entries via RPC");
-        let entries = self
-            .state
-            .node
-            .lock()
-            .await
-            .no_route_entries()
-            .into_iter()
-            .map(|nrs| NoRouteSubnet {
-                subnet: nrs.subnet().to_string(),
-                expiration: nrs
-                    .entry_expires()
-                    .duration_since(tokio::time::Instant::now())
-                    .as_secs()
-                    .to_string(),
-            })
-            .collect();
-
-        Ok(entries)
-    }
-
     async fn get_proxies(&self) -> RpcResult<Vec<Ipv6Addr>> {
         debug!("Listing known proxies via RPC");
         let proxies = self.state.node.lock().await.known_proxies();
@@ -347,6 +326,32 @@ where
         debug!("Stopping proxy probe via RPC");
         self.state.node.lock().await.stop_proxy_scan();
         Ok(true)
+    }
+
+    async fn get_packet_statistics(&self) -> RpcResult<PacketStatistics> {
+        debug!("Loading packet statistics via RPC");
+        let stats = self.state.node.lock().await.packet_statistics();
+
+        Ok(PacketStatistics {
+            by_source: stats
+                .by_source
+                .into_iter()
+                .map(|ps| PacketStatEntry {
+                    ip: ps.ip.to_string(),
+                    packet_count: ps.packet_count,
+                    byte_count: ps.byte_count,
+                })
+                .collect(),
+            by_destination: stats
+                .by_destination
+                .into_iter()
+                .map(|ps| PacketStatEntry {
+                    ip: ps.ip.to_string(),
+                    packet_count: ps.packet_count,
+                    byte_count: ps.byte_count,
+                })
+                .collect(),
+        })
     }
 
     async fn discover(&self) -> RpcResult<serde_json::Value> {

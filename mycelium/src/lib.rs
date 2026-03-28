@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::cdn::Cdn;
-use crate::proxy::{ConnectionError, Proxy};
+use crate::packet_queue::IncomingPacketQueue;
+use crate::proxy::{Proxy, ProxyError};
 use crate::tun::TunConfig;
 use bytes::BytesMut;
 use data::DataPlane;
@@ -17,8 +18,8 @@ use message::{
     MessageId, MessageInfo, MessagePushResponse, MessageStack, PushMessageError, ReceivedMessage,
 };
 use metrics::Metrics;
-use peer_manager::{PeerExists, PeerNotFound, PeerStats, PrivateNetworkKey};
-use routing_table::{NoRouteSubnet, QueriedSubnet, RouteEntry};
+use peer_manager::{PeerDiscoveryMode, PeerExists, PeerNotFound, PeerStats, PrivateNetworkKey};
+use routing_table::{QueriedSubnet, RouteEntry};
 use subnet::Subnet;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
@@ -37,6 +38,7 @@ pub mod message;
 mod metric;
 pub mod metrics;
 pub mod packet;
+mod packet_queue;
 mod peer;
 pub mod peer_manager;
 mod proxy;
@@ -69,7 +71,9 @@ pub struct Config<M> {
     /// Listen port for Quic connections.
     pub quic_listen_port: Option<u16>,
     /// Udp port for peer discovery.
-    pub peer_discovery_port: Option<u16>,
+    pub peer_discovery_port: u16,
+    /// Mode for peer discovery (All, Disabled, or Filtered).
+    pub peer_discovery_mode: PeerDiscoveryMode,
     /// Name for the TUN device.
     #[cfg(any(
         target_os = "linux",
@@ -164,34 +168,43 @@ where
         .expect("64 is a valid IPv6 prefix size; qed");
 
         // Creating a new Router instance
-        let router = match router::Router::new(
-            config.update_workers,
-            tun_tx,
-            node_subnet,
-            vec![node_subnet],
-            (config.node_key, node_pub_key),
-            vec![
-                Box::new(filters::AllowedSubnet::new(
-                    Subnet::new(GLOBAL_SUBNET_ADDRESS, GLOBAL_SUBNET_PREFIX_LEN)
-                        .expect("Global subnet is properly defined; qed"),
-                )),
-                Box::new(filters::MaxSubnetSize::<64>),
-                Box::new(filters::RouterIdOwnsSubnet),
-            ],
-            config.metrics.clone(),
-        ) {
-            Ok(router) => {
-                info!(
-                    "Router created. Pubkey: {:x}",
-                    BytesMut::from(&router.node_public_key().as_bytes()[..])
-                );
-                router
-            }
-            Err(e) => {
-                error!("Error creating router: {e}");
-                panic!("Error creating router: {e}");
-            }
-        };
+        let (router, pending_packet_rx, timeout_packet_rx, incoming_route_rx) =
+            match router::Router::new(
+                config.update_workers,
+                tun_tx,
+                node_subnet,
+                vec![node_subnet],
+                (config.node_key, node_pub_key),
+                vec![
+                    Box::new(filters::AllowedSubnet::new(
+                        Subnet::new(GLOBAL_SUBNET_ADDRESS, GLOBAL_SUBNET_PREFIX_LEN)
+                            .expect("Global subnet is properly defined; qed"),
+                    )),
+                    Box::new(filters::MaxSubnetSize::<64>),
+                    Box::new(filters::RouterIdOwnsSubnet),
+                ],
+                config.metrics.clone(),
+            ) {
+                Ok((router, pending_packet_rx, timeout_packet_rx, incoming_route_rx)) => {
+                    info!(
+                        "Router created. Pubkey: {:x}",
+                        BytesMut::from(&router.node_public_key().as_bytes()[..])
+                    );
+                    (
+                        router,
+                        pending_packet_rx,
+                        timeout_packet_rx,
+                        incoming_route_rx,
+                    )
+                }
+                Err(e) => {
+                    error!("Error creating router: {e}");
+                    panic!("Error creating router: {e}");
+                }
+            };
+
+        // Create the incoming packet queue for packets waiting for sender's route
+        let incoming_packet_queue = IncomingPacketQueue::new();
 
         // Creating a new PeerManager instance
         let pm = peer_manager::PeerManager::new(
@@ -199,8 +212,8 @@ where
             config.peers,
             config.tcp_listen_port,
             config.quic_listen_port,
-            config.peer_discovery_port.unwrap_or_default(),
-            config.peer_discovery_port.is_none(),
+            config.peer_discovery_port,
+            config.peer_discovery_mode,
             config.private_network_config,
             config.metrics,
             config.firewall_mark,
@@ -226,6 +239,10 @@ where
                 futures::sink::drain(),
                 msg_sender,
                 tun_rx,
+                pending_packet_rx,
+                timeout_packet_rx,
+                incoming_packet_queue,
+                incoming_route_rx,
             )
         } else {
             #[cfg(not(any(
@@ -270,12 +287,22 @@ where
                 let (rxhalf, txhalf) = tun::new(tun_config).await?;
 
                 info!("Node overlay IP: {node_addr}");
-                DataPlane::new(router.clone(), rxhalf, txhalf, msg_sender, tun_rx)
+                DataPlane::new(
+                    router.clone(),
+                    rxhalf,
+                    txhalf,
+                    msg_sender,
+                    tun_rx,
+                    pending_packet_rx,
+                    timeout_packet_rx,
+                    incoming_packet_queue,
+                    incoming_route_rx,
+                )
             }
         };
 
         let dns = if config.enable_dns {
-            Some(dns::Resolver::new().await)
+            Some(dns::Resolver::new(router.clone()).await)
         } else {
             None
         };
@@ -340,14 +367,14 @@ where
         self.router.load_queried_subnets()
     }
 
-    /// List all [`subnets with no route`](NoRouteSubnet) in the system.
-    pub fn no_route_entries(&self) -> Vec<NoRouteSubnet> {
-        self.router.load_no_route_entries()
-    }
-
     /// Get public key from the IP of `Node`
     pub fn get_pubkey_from_ip(&self, ip: IpAddr) -> Option<crypto::PublicKey> {
         self.router.get_pubkey(ip)
+    }
+
+    /// Get packet statistics grouped by source and destination IP.
+    pub fn packet_statistics(&self) -> router::PacketStatistics {
+        self.router.packet_statistics()
     }
 }
 
@@ -370,7 +397,7 @@ where
     pub fn connect_proxy(
         &self,
         remote: Option<SocketAddr>,
-    ) -> impl Future<Output = Result<SocketAddr, ConnectionError>> + Send {
+    ) -> impl Future<Output = Result<SocketAddr, ProxyError>> + Send {
         let proxy = self.proxy.clone();
         async move { proxy.connect(remote).await }
     }

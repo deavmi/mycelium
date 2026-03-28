@@ -76,6 +76,19 @@ pub enum PeerType {
     Inbound,
 }
 
+/// Defines how peer discovery operates regarding network interfaces.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PeerDiscoveryMode {
+    /// Discover peers on all qualifying interfaces (default behavior).
+    #[default]
+    All,
+    /// Peer discovery is completely disabled.
+    Disabled,
+    /// Only discover peers on interfaces whose names match the provided list.
+    Filtered(Vec<String>),
+}
+
 /// Local info about a peer.
 struct PeerInfo {
     /// Details how we found out about this peer.
@@ -186,7 +199,7 @@ where
         tcp_listen_port: u16,
         quic_listen_port: Option<u16>,
         peer_discovery_port: u16,
-        disable_peer_discovery: bool,
+        peer_discovery_mode: PeerDiscoveryMode,
         private_network_config: Option<(String, PrivateNetworkKey)>,
         metrics: M,
         firewall_mark: Option<u32>,
@@ -266,16 +279,30 @@ where
         let handle = tokio::spawn(peer_manager.inner.clone().connect_to_peers());
         peer_manager.abort_handles.push(handle.abort_handle());
 
-        // Discover local peers, this does not actually connect to them. That is handle by the
+        // Discover local peers, this does not actually connect to them. That is handled by the
         // connect_to_peers task.
-        if !disable_peer_discovery {
-            let handle = tokio::spawn(
-                peer_manager
-                    .inner
-                    .clone()
-                    .local_discovery(peer_discovery_port),
-            );
-            peer_manager.abort_handles.push(handle.abort_handle());
+        match peer_discovery_mode {
+            PeerDiscoveryMode::Disabled => {
+                // No discovery task spawned
+            }
+            PeerDiscoveryMode::All => {
+                let handle = tokio::spawn(
+                    peer_manager
+                        .inner
+                        .clone()
+                        .local_discovery(peer_discovery_port, None),
+                );
+                peer_manager.abort_handles.push(handle.abort_handle());
+            }
+            PeerDiscoveryMode::Filtered(interfaces) => {
+                let handle = tokio::spawn(
+                    peer_manager
+                        .inner
+                        .clone()
+                        .local_discovery(peer_discovery_port, Some(interfaces)),
+                );
+                peer_manager.abort_handles.push(handle.abort_handle());
+            }
         }
 
         Ok(peer_manager)
@@ -642,7 +669,6 @@ where
             }
         };
         let mut config = quinn::ClientConfig::new(Arc::new(qcc));
-        // Todo: tweak transport config
         let mut transport_config = TransportConfig::default();
         transport_config.max_concurrent_uni_streams(0_u8.into());
         // Larger than needed for now, just in case
@@ -652,17 +678,22 @@ where
         transport_config.max_idle_timeout(Some(Duration::from_secs(60).try_into().unwrap()));
         transport_config.mtu_discovery_config(Some(MtuDiscoveryConfig::default()));
         transport_config.keep_alive_interval(Some(Duration::from_secs(20)));
-        // we don't use datagrams.
         transport_config.datagram_receive_buffer_size(Some(16 << 20));
         transport_config.datagram_send_buffer_size(16 << 20);
         transport_config.initial_mtu(1500);
+        transport_config.enable_segmentation_offload(true);
+        transport_config.send_window((8 * (10u32 << 20)).into());
+        transport_config.stream_receive_window((10u32 << 20).into());
+        let mut congestion_controller = congestion::CubicConfig::default();
+        congestion_controller.initial_window(1 << 22); // 4MiB
+        transport_config.congestion_controller_factory(Arc::new(congestion_controller));
         config.transport_config(Arc::new(transport_config));
 
         match quic_socket.connect_with(config, endpoint.address(), "dummy.mycelium") {
             Ok(connecting) => match connecting.await {
                 Ok(con) => match con.open_bi().await {
                     Ok((tx, rx)) => {
-                        let q_con = Quic::new(tx, rx, con, ct.tx_bytes, ct.rx_bytes);
+                        let q_con = Quic::new(tx, rx, con, ct.rx_bytes, ct.tx_bytes);
                         let res = {
                             let router = self.router.lock().unwrap();
                             let router_data_tx = router.router_data_tx();
@@ -1046,7 +1077,12 @@ where
     }
 
     /// Use multicast discovery to find local peers.
-    async fn local_discovery(self: Arc<Self>, peer_discovery_port: u16) {
+    /// When `allowed_interfaces` is provided, only join multicast groups on those interfaces.
+    async fn local_discovery(
+        self: Arc<Self>,
+        peer_discovery_port: u16,
+        allowed_interfaces: Option<Vec<String>>,
+    ) {
         let rid = self.router.lock().unwrap().router_id();
 
         let multicast_destination = LL_PEER_DISCOVERY_GROUP
@@ -1077,7 +1113,7 @@ where
         let mut joined_interfaces = HashSet::new();
         // Join the multicast discovery group on newly detected interfaces.
         let join_new_interfaces = |joined_interfaces: &mut HashSet<_>| {
-            let ipv6_nics = list_ipv6_interface_ids()?;
+            let ipv6_nics = list_ipv6_interface_ids(allowed_interfaces.as_deref())?;
             // Keep the existing interfaces, removing interface ids we previously joined but are no
             // longer found when listing ids. We simply discard unknown ids, and assume if the
             // interface is gone (or it's IPv6), that we also implicitly left the group (i.e. no
@@ -1231,9 +1267,12 @@ fn make_quic_endpoint(
     quic_listen_port: u16,
     firewall_mark: Option<u32>,
 ) -> Result<quinn::Endpoint, Box<dyn std::error::Error>> {
-    // Install ring crypto provider for rustls
-    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider())
-        .expect("Crypto provider has not been installed yet");
+    // Install ring crypto provider for rustls (only if not already installed)
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider())
+            .expect("Failed to install crypto provider");
+    }
+
     // Generate self signed certificate certificate.
     // TODO: sign with router keys
     let cert = rcgen::generate_simple_self_signed(vec![format!("{router_id}")])?;
@@ -1261,7 +1300,7 @@ fn make_quic_endpoint(
     transport_config.stream_receive_window((10u32 << 20).into());
     let mut congestion_controller = congestion::CubicConfig::default();
     congestion_controller.initial_window(1 << 22); // 4MiB
-                                                   // TODO: further tweak this.
+    transport_config.congestion_controller_factory(Arc::new(congestion_controller));
 
     let socket = std::net::UdpSocket::bind(("::", quic_listen_port))
         .and_then(|socket| set_fw_mark(socket, firewall_mark))?;
@@ -1353,7 +1392,10 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
 }
 
 /// Get a list of the interface identifiers of every network interface with a local IPv6 IP.
-fn list_ipv6_interface_ids() -> Result<HashSet<u32>, Box<dyn std::error::Error>> {
+/// When `allowed_interfaces` is provided, only interfaces with matching names are returned.
+fn list_ipv6_interface_ids(
+    allowed_interfaces: Option<&[String]>,
+) -> Result<HashSet<u32>, Box<dyn std::error::Error>> {
     let mut nics = HashSet::new();
     for nic in netdev::get_interfaces()
         .into_iter()
@@ -1364,6 +1406,12 @@ fn list_ipv6_interface_ids() -> Result<HashSet<u32>, Box<dyn std::error::Error>>
                 && !nic.is_point_to_point()
                 && nic.is_multicast()
                 && nic.is_up()
+        })
+        // Apply name filter if provided
+        .filter(|nic| {
+            allowed_interfaces
+                .map(|names| names.iter().any(|name| name == &nic.name))
+                .unwrap_or(true)
         })
     {
         for addr in nic.ipv6 {

@@ -28,6 +28,8 @@ network will receive an overlay network IP in the 400::/7 range.
 Get an useable binary, either by downloading [an artifact from a release](https://github.com/threefoldtech/mycelium/releases),
 or by [checking out and building the code yourself](#developing).
 
+For ArchLinux distribution there's [mycelium AUR package](https://aur.archlinux.org/packages/mycelium) available.
+
 ### Windows
 
 Download the [mycelium_installer.msi](https://github.com/threefoldtech/mycelium/releases/latest/download/mycelium_installer.msi) and run the installer.
@@ -225,6 +227,11 @@ Refer to the README files in those directories for more info.
 
 In case a release build is required, the `--release` flag can be added to the cargo
 command (`cargo build --release`).
+
+### Windows
+
+On windows, you need to have a copy of [`wintun.dll`](https://www.wintun.net/)
+available.
 
 ## Cross compilation
 

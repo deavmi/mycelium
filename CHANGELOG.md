@@ -7,6 +7,96 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.5] - 2026-03-27
+
+### Changed
+
+- When using quic connections, apply backpressure if the send buffer is full instead
+  of dropping packets.
+- Message reply packets no longer contain the message data.
+
+### Fixed
+
+- The version command in the CLI now once again correctly identifies if the binary
+  is the regular mycelium or the mycelium-private binary.
+- Fixed router seqno rate limiting, which essentially prevented seqno bumping from
+  working. This should improve route acquisition after spurious network interrupts.
+- Route request cache now properly cleans and maintains entries to avoid sending
+  duplicates to peers.
+- Make sure the configuration for Quic connections is the same for outbound and
+  inbound connections.
+- Fix bound check on message ACK.
+- When forwarding messages to a unix socket avoid sending the message twice if
+  a duplicate DONE packet arrives.
+- Outbound quic connections now properly report received and transmitted bytes,
+  instead of the inverted values.
+
+## [0.7.4] - 2026-03-23
+
+### Added
+
+- When a new peer connects, immediately announce our own subnet.
+
+### Changed
+
+- Reduced time before an unacknowledged message chunk gets retransmitted.
+- When a message chunk gets ACK'ed, immediately send a new chunk.
+
+### Fixed
+
+- On unix based systems, the created key file is no longer readable system-wide.
+- The message subsystem no longer removes peeked message if a topic filter is set.
+- Properly send back a read acknowledgement after popping/peeking a message while
+  a topic filter is set.
+- When we stop probing for socks proxies, replace the cancellation token so future
+  probes behave as expected.
+- Properly return an error from the API when trying to connect a proxy if we can't
+  bind the local socket.
+
+### Deprecated
+
+- Mycelium-ui (the stand alone GUI) will be removed in the next version. It was
+  never formally launched as a binary, and its inteded use has been replaced by
+  myceliumflut, which embeds a full mycelium node.
+
+### Removed
+
+- No longer maintain a list of "no-route" entries if a subnet query times out.
+
+## [0.7.3] - 2026-02-09
+
+### Fixed
+
+- Pin wix version used in release flows for windows msi artifact to avoid version
+  incompatibilities.
+
+## [0.7.2] - 2026-02-09
+
+### Added
+
+- You can now limit peer discovery to specific interfaces by specifying the
+  `--peer-discovery-interface <interface_name>`. The flag can be specified multiple
+  times to allow multiple interfaces.
+- Track packets which have been handled by src IP and dst IP (separately). The
+  stats can be accessed through the API.
+- Active route requests are now sent to peers when they connect
+
+### Changed
+
+- No longer block the router when a subnet is being queried until the query resolves
+  or times out.
+- Entries for subnets which did not resolve are now cleared after 5 seconds (down
+  from 60 seconds)
+- Route requests now have 15 seconds to resolve (up from 5 seconds), to increase
+  the chance of recovery after a spurious link issue
+
+## [0.7.1] - 2026-01-05
+
+### Added
+
+- Support Quic peers in the mobile wrapper crate.
+- Support HTTP API in the mobile wrapper crate.
+
 ## [0.7.0] - 2025-12-08
 
 ### Added
@@ -18,7 +108,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The Quic connection type now uses quic datagrams to transport __data__ (packets
+- The Quic connection type now uses quic datagrams to transport **data** (packets
   coming from the TUN device) to the peer. Protocol traffic is still sent over a
   bidirectional Quic stream (which supports retransmits).
 
@@ -660,4 +750,9 @@ This is a breaking change, check the main README file for update info.
 [0.6.1]: https://github.com/threefoldtech/mycelium/compare/v0.6.0...v0.6.1
 [0.6.2]: https://github.com/threefoldtech/mycelium/compare/v0.6.1...v0.6.2
 [0.7.0]: https://github.com/threefoldtech/mycelium/compare/v0.6.2...v0.7.0
-[unreleased]: https://github.com/threefoldtech/mycelium/compare/v0.7.0...HEAD
+[0.7.1]: https://github.com/threefoldtech/mycelium/compare/v0.7.0...v0.7.1
+[0.7.2]: https://github.com/threefoldtech/mycelium/compare/v0.7.1...v0.7.2
+[0.7.3]: https://github.com/threefoldtech/mycelium/compare/v0.7.2...v0.7.3
+[0.7.4]: https://github.com/threefoldtech/mycelium/compare/v0.7.3...v0.7.4
+[0.7.5]: https://github.com/threefoldtech/mycelium/compare/v0.7.4...v0.7.5
+[unreleased]: https://github.com/threefoldtech/mycelium/compare/v0.7.5...HEAD
